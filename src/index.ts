@@ -436,6 +436,94 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
+type MetadataSearchResult = {
+  kb: string;
+  score: number;
+  file: string;
+  path: string;
+  item: CaseIndexItem;
+};
+
+type FullTextSearchResult = {
+  kb: string;
+  score: number;
+  company: string;
+  short?: string;
+  code?: string;
+  board?: string;
+  lawyer?: string;
+  file: string;
+  path: string;
+  matchedTerms: string[];
+  matchCount: number;
+  section: string;
+  snippet: string;
+  item: CaseIndexItem;
+};
+
+async function searchMetadata(
+  index: CaseIndexItem[],
+  query: string,
+  limit?: number,
+): Promise<MetadataSearchResult[]> {
+  const results = index
+    .map((item) => ({ item, score: scoreItem(item, query) }))
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  const sliced = limit !== undefined ? results.slice(0, limit) : results;
+
+  return sliced.map(({ item, score }) => ({
+    kb: 'ipo',
+    score,
+    file: item.file,
+    path: `cases/${item.file}`,
+    item,
+  }));
+}
+
+async function searchFullText(
+  index: CaseIndexItem[],
+  query: string,
+  limit?: number,
+): Promise<FullTextSearchResult[]> {
+  const sources = await mapWithConcurrency(
+    index,
+    async (item) => {
+      const path = `cases/${item.file}`;
+      return { item, path, source: await fetchSource(path) };
+    },
+    SOURCE_FETCH_CONCURRENCY,
+  );
+
+  const results = sources
+    .map(({ item, path, source }) => {
+      const match = matchFullText(source, query);
+      if (!match) return null;
+
+      return {
+        kb: 'ipo',
+        score: match.score,
+        company: item.company ?? item.short ?? item.file,
+        short: item.short,
+        code: item.code,
+        board: item.board,
+        lawyer: item.lawyer,
+        file: item.file,
+        path,
+        matchedTerms: match.matchedTerms,
+        matchCount: match.matchCount,
+        section: match.section,
+        snippet: match.snippet,
+        item,
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => item !== null)
+    .sort((a, b) => b.score - a.score);
+
+  return limit !== undefined ? results.slice(0, limit) : results;
+}
+
 const server = new McpServer({
   name: 'legal-knowledge-mcp',
   version: '0.1.0',
@@ -458,6 +546,112 @@ server.registerTool(
 );
 
 server.registerTool(
+  'search',
+  {
+    description: '统一法律知识库检索，同时检索结构化元数据和案例正文，日常检索优先使用本工具；命中后建议调用 read_source 核验原文。',
+    inputSchema: z.object({
+      kb: z.enum(['ipo']).default('ipo'),
+      query: z.string().min(1),
+      limit: z.number().int().min(1).max(50).default(10),
+    }),
+  },
+  async ({ kb, query, limit }) => {
+    if (kb !== 'ipo') throw new Error(`Unsupported knowledge base: ${kb}`);
+
+    const index = await loadIndex();
+    const candidateLimit = Math.max(limit * 3, 30);
+
+    const [metaResults, fulltextResults] = await Promise.all([
+      searchMetadata(index, query, candidateLimit),
+      searchFullText(index, query, candidateLimit),
+    ]);
+
+    const maxMetaScore = metaResults.length > 0 ? Math.max(...metaResults.map((r) => r.score)) : 0;
+    const maxFullTextScore = fulltextResults.length > 0 ? Math.max(...fulltextResults.map((r) => r.score)) : 0;
+
+    const mergedMap = new Map<
+      string,
+      {
+        item: CaseIndexItem;
+        path: string;
+        metaHit?: MetadataSearchResult;
+        fulltextHit?: FullTextSearchResult;
+      }
+    >();
+
+    for (const meta of metaResults) {
+      mergedMap.set(meta.path, {
+        item: meta.item,
+        path: meta.path,
+        metaHit: meta,
+      });
+    }
+
+    for (const ft of fulltextResults) {
+      const existing = mergedMap.get(ft.path);
+      if (existing) {
+        existing.fulltextHit = ft;
+      } else {
+        mergedMap.set(ft.path, {
+          item: ft.item,
+          path: ft.path,
+          fulltextHit: ft,
+        });
+      }
+    }
+
+    const unifiedResults = Array.from(mergedMap.values()).map(({ item, path, metaHit, fulltextHit }) => {
+      const match_types: ('metadata' | 'fulltext')[] = [];
+      if (metaHit) match_types.push('metadata');
+      if (fulltextHit) match_types.push('fulltext');
+
+      const metadata_score = metaHit ? metaHit.score : 0;
+      const fulltext_score = fulltextHit ? fulltextHit.score : 0;
+
+      const metaNorm = maxMetaScore > 0 ? (metadata_score / maxMetaScore) * 50 : 0;
+      const ftNorm = maxFullTextScore > 0 ? (fulltext_score / maxFullTextScore) * 50 : 0;
+      const bonus = metaHit && fulltextHit ? 20 : 0;
+
+      const score = Math.round((metaNorm + ftNorm + bonus) * 100) / 100;
+
+      const snippets: string[] = fulltextHit?.snippet ? [fulltextHit.snippet] : [];
+      const matchedTerms: string[] = fulltextHit?.matchedTerms ?? [];
+      const section: string | undefined = fulltextHit?.section;
+
+      return {
+        kb: 'ipo',
+        company: item.company ?? item.short ?? item.file,
+        short: item.short ?? '',
+        code: item.code ?? '',
+        board: item.board ?? '',
+        lawyer: item.lawyer ?? '',
+        file: item.file,
+        path,
+        match_types,
+        score,
+        metadata_score,
+        fulltext_score,
+        section,
+        snippets,
+        matchedTerms,
+      };
+    });
+
+    unifiedResults.sort((a, b) => b.score - a.score);
+    const finalResults = unifiedResults.slice(0, limit);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(finalResults, null, 2),
+        },
+      ],
+    };
+  },
+);
+
+server.registerTool(
   'search_kb',
   {
     description: '按公司、证券代码、板块、律师、标签和文件名检索知识库索引。第一版为元数据关键词检索。',
@@ -471,23 +665,22 @@ server.registerTool(
     if (kb !== 'ipo') throw new Error(`Unsupported knowledge base: ${kb}`);
 
     const index = await loadIndex();
-    const results = index
-      .map((item) => ({ item, score: scoreItem(item, query) }))
-      .filter((x) => x.score > 0)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit)
-      .map(({ item, score }) => ({
-        kb: 'ipo',
-        score,
-        ...item,
-        path: `cases/${item.file}`,
-      }));
+    const results = await searchMetadata(index, query, limit);
 
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(results, null, 2),
+          text: JSON.stringify(
+            results.map(({ item, score, path }) => ({
+              kb: 'ipo',
+              score,
+              ...item,
+              path,
+            })),
+            null,
+            2,
+          ),
         },
       ],
     };
@@ -508,41 +701,27 @@ server.registerTool(
     if (kb !== 'ipo') throw new Error(`Unsupported knowledge base: ${kb}`);
 
     const index = await loadIndex();
-    const sources = await mapWithConcurrency(
-      index,
-      async (item) => {
-        const path = `cases/${item.file}`;
-        return { item, path, source: await fetchSource(path) };
-      },
-      SOURCE_FETCH_CONCURRENCY,
-    );
-
-    const results = sources
-      .map(({ item, path, source }) => {
-        const match = matchFullText(source, query);
-        if (!match) return null;
-
-        return {
-          kb: 'ipo',
-          score: match.score,
-          company: item.company ?? item.short ?? item.file,
-          file: item.file,
-          path,
-          matchedTerms: match.matchedTerms,
-          matchCount: match.matchCount,
-          section: match.section,
-          snippet: match.snippet,
-        };
-      })
-      .filter((item): item is NonNullable<typeof item> => item !== null)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit);
+    const results = await searchFullText(index, query, limit);
 
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(results, null, 2),
+          text: JSON.stringify(
+            results.map((r) => ({
+              kb: r.kb,
+              score: r.score,
+              company: r.company,
+              file: r.file,
+              path: r.path,
+              matchedTerms: r.matchedTerms,
+              matchCount: r.matchCount,
+              section: r.section,
+              snippet: r.snippet,
+            })),
+            null,
+            2,
+          ),
         },
       ],
     };
