@@ -73,6 +73,369 @@ function scoreItem(item: CaseIndexItem, query: string): number {
   return score;
 }
 
+type TextRange = {
+  start: number;
+  end: number;
+};
+
+type SectionHeading = TextRange & {
+  title: string;
+};
+
+type TextMatch = {
+  score: number;
+  matchedTerms: string[];
+  matchCount: number;
+  section: string;
+  snippet: string;
+};
+
+type QueryTermGroup = {
+  term: string;
+  variants: string[][];
+};
+
+type SearchCandidate = {
+  anchor: TextRange;
+  nearbyTerms: string[];
+  nearbyGroupCount: number;
+  span: number;
+  section: string;
+  sectionHeading?: SectionHeading;
+  sectionScore: number;
+  proximityScore: number;
+  candidateScore: number;
+};
+
+const SOURCE_FETCH_CONCURRENCY = 8;
+const CANDIDATE_RADIUS = 260;
+const SNIPPET_BEFORE = 180;
+const SNIPPET_AFTER = 240;
+const sourceCache = new Map<string, Promise<string>>();
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeSource(text: string): string {
+  return text
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+/g, ' ').trim())
+    .join('\n')
+    .trim();
+}
+
+function findFlexibleMatches(text: string, term: string): TextRange[] {
+  const compactTerm = normalize(term).replace(/\s+/g, '');
+  if (!compactTerm) return [];
+
+  const pattern = [...compactTerm].map(escapeRegExp).join('\\s*');
+  const matches: TextRange[] = [];
+  for (const match of text.matchAll(new RegExp(pattern, 'giu'))) {
+    if (match.index === undefined) continue;
+    matches.push({
+      start: match.index,
+      end: match.index + match[0].length,
+    });
+  }
+  return matches;
+}
+
+function findNearestSpan(groups: TextRange[][]): number {
+  if (groups.length < 2) return 0;
+
+  let bestSpan = Number.POSITIVE_INFINITY;
+  for (const anchor of groups[0]) {
+    const selected = [anchor];
+    for (const group of groups.slice(1)) {
+      const nearest = group.reduce((best, current) => {
+        const bestDistance = Math.abs(best.start - anchor.start);
+        const currentDistance = Math.abs(current.start - anchor.start);
+        return currentDistance < bestDistance ? current : best;
+      });
+      selected.push(nearest);
+    }
+
+    const start = Math.min(...selected.map((item) => item.start));
+    const end = Math.max(...selected.map((item) => item.end));
+    bestSpan = Math.min(bestSpan, end - start);
+  }
+
+  return bestSpan;
+}
+
+function findTermSplits(text: string, term: string): string[][] {
+  const compactTerm = normalize(term).replace(/\s+/g, '');
+  const characters = [...compactTerm];
+  if (characters.length < 4 || !/[\u3400-\u9fff]/u.test(compactTerm)) return [];
+
+  const partitions: string[][] = [];
+  for (let split = 2; split <= characters.length - 2; split += 1) {
+    partitions.push([
+      characters.slice(0, split).join(''),
+      characters.slice(split).join(''),
+    ]);
+  }
+  for (let firstSplit = 2; firstSplit <= characters.length - 4; firstSplit += 1) {
+    for (let secondSplit = firstSplit + 2; secondSplit <= characters.length - 2; secondSplit += 1) {
+      partitions.push([
+        characters.slice(0, firstSplit).join(''),
+        characters.slice(firstSplit, secondSplit).join(''),
+        characters.slice(secondSplit).join(''),
+      ]);
+    }
+  }
+
+  const usefulPartitions: { parts: string[]; score: number }[] = [];
+  for (const parts of partitions) {
+    const matches = parts.map((part) => findFlexibleMatches(text, part));
+    if (matches.some((ranges) => ranges.length === 0)) continue;
+
+    const span = findNearestSpan(matches);
+    if (span > CANDIDATE_RADIUS * 2) continue;
+
+    const occurrenceScore = matches.reduce(
+      (score, ranges) => score + Math.min(ranges.length, 10) * 2,
+      0,
+    );
+    const lengthScore = parts.reduce((score, part) => score + part.length * part.length, 0);
+    const proximityScore = Math.max(0, 80 - Math.floor(span / 4));
+    const score = occurrenceScore + lengthScore + proximityScore;
+    usefulPartitions.push({ parts, score });
+  }
+
+  return usefulPartitions
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8)
+    .map(({ parts }) => parts);
+}
+
+function extractSections(text: string): SectionHeading[] {
+  const sections: SectionHeading[] = [];
+  for (const match of text.matchAll(/^#{1,6}\s+(.+?)\s*$/gm)) {
+    if (match.index === undefined) continue;
+    sections.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      title: match[1].trim(),
+    });
+  }
+  return sections;
+}
+
+function findSectionHeading(sections: SectionHeading[], position: number): SectionHeading | undefined {
+  let low = 0;
+  let high = sections.length - 1;
+  let found = -1;
+
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    if (sections[middle].start <= position) {
+      found = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+
+  return found >= 0 ? sections[found] : undefined;
+}
+
+function scoreSection(text: string, section: string, position: number): number {
+  if (!section) return 0;
+
+  let score = 0;
+  if (/问题|问询|回复/u.test(section)) score += 40;
+  if (/核查|整改|合规|用工|劳务派遣/u.test(section)) score += 15;
+  if (/法律问题总览|公司与审核概况/u.test(section)) score -= 80;
+
+  const context = text.slice(
+    Math.max(0, position - SNIPPET_BEFORE),
+    Math.min(text.length, position + SNIPPET_AFTER),
+  );
+  if (/问询要点|回复与核查要点|核查程序|核查意见|整改/u.test(context)) score += 30;
+
+  return score;
+}
+
+function buildSnippet(text: string, candidate: SearchCandidate): string {
+  let start = Math.max(0, candidate.anchor.start - SNIPPET_BEFORE);
+  const end = Math.min(text.length, candidate.anchor.end + SNIPPET_AFTER);
+
+  if (candidate.sectionHeading && candidate.sectionHeading.start >= start) {
+    start = candidate.sectionHeading.start;
+  }
+
+  const snippetText = text.slice(start, end).replace(/\s+/g, ' ').trim();
+  return `${start > 0 ? '…' : ''}${snippetText}${end < text.length ? '…' : ''}`;
+}
+
+function matchFullText(source: string, query: string): TextMatch | null {
+  const searchable = normalizeSource(source);
+  const normalizedQuery = normalize(query);
+  if (!normalizedQuery || !searchable) return null;
+
+  const queryTerms = [...new Set(normalizedQuery.split(' ').filter(Boolean))];
+  const termGroups: QueryTermGroup[] = queryTerms.map((term) => {
+    const splits = findTermSplits(searchable, term);
+    return {
+      term,
+      variants: [[term], ...splits],
+    };
+  });
+  const terms = [...new Set(termGroups.flatMap((group) => group.variants.flat()))];
+  const occurrencesByTerm = new Map<string, TextRange[]>();
+  for (const term of terms) {
+    occurrencesByTerm.set(term, findFlexibleMatches(searchable, term));
+  }
+
+  const matchedGroups = termGroups.filter((group) => {
+    const primaryMatch = (occurrencesByTerm.get(group.term)?.length ?? 0) > 0;
+    const splitMatch = group.variants.slice(1).some((variant) => variant.every(
+      (term) => (occurrencesByTerm.get(term)?.length ?? 0) > 0,
+    ));
+    return primaryMatch || splitMatch;
+  });
+  if (matchedGroups.length === 0) return null;
+
+  const matchedTerms = matchedGroups.map((group) => group.term);
+
+  const matchCount = matchedGroups.reduce((count, group) => {
+    const primaryCount = occurrencesByTerm.get(group.term)?.length ?? 0;
+    const splitCounts = group.variants.slice(1).map((variant) =>
+      variant.reduce(
+        (variantCount, term) => variantCount + (occurrencesByTerm.get(term)?.length ?? 0),
+        0,
+      ),
+    );
+    return count + Math.max(primaryCount, 0, ...splitCounts);
+  }, 0);
+  const phraseMatches = findFlexibleMatches(searchable, normalizedQuery);
+  const sections = extractSections(searchable);
+  const anchors = terms.flatMap((term) =>
+    (occurrencesByTerm.get(term) ?? []).map((range) => ({ range })),
+  );
+  anchors.push(...phraseMatches.map((range) => ({ range })));
+
+  const candidates: SearchCandidate[] = anchors.map(({ range }) => {
+    const windowStart = Math.max(0, range.start - CANDIDATE_RADIUS);
+    const windowEnd = Math.min(searchable.length, range.end + CANDIDATE_RADIUS);
+    const nearbyTerms = terms.filter((term) =>
+      (occurrencesByTerm.get(term) ?? []).some(
+        (occurrence) => occurrence.start < windowEnd && occurrence.end > windowStart,
+      ),
+    );
+    const nearbyGroupCount = termGroups.filter((group) => {
+      const primaryNear = (occurrencesByTerm.get(group.term) ?? []).some(
+        (occurrence) => occurrence.start < windowEnd && occurrence.end > windowStart,
+      );
+      const splitNear = group.variants.slice(1).some((variant) => variant.every((term) =>
+        (occurrencesByTerm.get(term) ?? []).some(
+          (occurrence) => occurrence.start < windowEnd && occurrence.end > windowStart,
+        ),
+      ));
+      return primaryNear || splitNear;
+    }).length;
+    const nearbyRanges = nearbyTerms.flatMap((term) =>
+      (occurrencesByTerm.get(term) ?? []).filter(
+        (occurrence) => occurrence.start < windowEnd && occurrence.end > windowStart,
+      ),
+    );
+    const span = nearbyRanges.length > 1
+      ? Math.max(...nearbyRanges.map((item) => item.end)) - Math.min(...nearbyRanges.map((item) => item.start))
+      : 0;
+    const sectionHeading = findSectionHeading(sections, range.start);
+    const section = sectionHeading?.title ?? '未识别章节';
+    const sectionScore = scoreSection(searchable, sectionHeading?.title ?? '', range.start);
+    const nearbyPhraseHit = phraseMatches.some(
+      (phrase) => phrase.start < windowEnd && phrase.end > windowStart,
+    );
+    const proximityScore = nearbyGroupCount > 1
+      ? Math.max(0, 40 - Math.floor(span / 20))
+      : 0;
+    const candidateScore =
+      (nearbyPhraseHit ? 70 : 0) +
+      (nearbyGroupCount === termGroups.length ? 50 : 0) +
+      nearbyGroupCount * 10 +
+      proximityScore +
+      sectionScore;
+
+    return {
+      anchor: range,
+      nearbyTerms,
+      nearbyGroupCount,
+      span,
+      section,
+      sectionHeading,
+      sectionScore,
+      proximityScore,
+      candidateScore,
+    };
+  });
+
+  const bestCandidate = candidates.sort(
+    (a, b) =>
+      b.candidateScore - a.candidateScore ||
+      b.nearbyGroupCount - a.nearbyGroupCount ||
+      a.span - b.span ||
+      a.anchor.start - b.anchor.start,
+  )[0];
+  if (!bestCandidate) return null;
+
+  let score = 0;
+  if (phraseMatches.length > 0) score += 100;
+  if (matchedGroups.length === termGroups.length) score += 50;
+  score += matchedTerms.length * 10;
+  score += Math.min(matchCount, 20) * 2;
+  score += bestCandidate.proximityScore + bestCandidate.sectionScore;
+
+  return {
+    score,
+    matchedTerms,
+    matchCount,
+    section: bestCandidate.section,
+    snippet: buildSnippet(searchable, bestCandidate),
+  };
+}
+
+function fetchSource(path: string): Promise<string> {
+  const cached = sourceCache.get(path);
+  if (cached) return cached;
+
+  const pending = fetchRaw(KBS.ipo.repo, KBS.ipo.branch, path);
+  sourceCache.set(path, pending);
+  pending.catch(() => {
+    if (sourceCache.get(path) === pending) sourceCache.delete(path);
+  });
+  return pending;
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  worker: (item: T) => Promise<R>,
+  concurrency: number,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+
+  async function consume(): Promise<void> {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index]);
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    () => consume(),
+  );
+  await Promise.all(workers);
+  return results;
+}
+
 const server = new McpServer({
   name: 'legal-knowledge-mcp',
   version: '0.1.0',
@@ -119,6 +482,61 @@ server.registerTool(
         ...item,
         path: `cases/${item.file}`,
       }));
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(results, null, 2),
+        },
+      ],
+    };
+  },
+);
+
+server.registerTool(
+  'search_fulltext',
+  {
+    description: '遍历 ipo 知识库 cases/*.md 做全文关键词检索，返回公司、文件、匹配关键词和命中片段。多个关键词请用空格分隔。',
+    inputSchema: z.object({
+      kb: z.enum(['ipo']).default('ipo'),
+      query: z.string().min(1),
+      limit: z.number().int().min(1).max(50).default(10),
+    }),
+  },
+  async ({ kb, query, limit }) => {
+    if (kb !== 'ipo') throw new Error(`Unsupported knowledge base: ${kb}`);
+
+    const index = await loadIndex();
+    const sources = await mapWithConcurrency(
+      index,
+      async (item) => {
+        const path = `cases/${item.file}`;
+        return { item, path, source: await fetchSource(path) };
+      },
+      SOURCE_FETCH_CONCURRENCY,
+    );
+
+    const results = sources
+      .map(({ item, path, source }) => {
+        const match = matchFullText(source, query);
+        if (!match) return null;
+
+        return {
+          kb: 'ipo',
+          score: match.score,
+          company: item.company ?? item.short ?? item.file,
+          file: item.file,
+          path,
+          matchedTerms: match.matchedTerms,
+          matchCount: match.matchCount,
+          section: match.section,
+          snippet: match.snippet,
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
 
     return {
       content: [
