@@ -1,22 +1,13 @@
 {
   "name": "legal-knowledge-mcp",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.2.0",
+  "description": "统一法律知识库 MCP Server（无状态 Streamable HTTP，零依赖）",
   "type": "module",
+  "main": "server.mjs",
   "scripts": {
-    "start": "tsx src/index.ts",
-    "build": "tsc -p tsconfig.json"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/server": "^2.0.0",
-    "zod": "^4.0.0"
-  },
-  "devDependencies": {
-    "tsx": "^4.20.0",
-    "typescript": "^5.9.0",
-    "@types/node": "^24.0.0"
+    "start": "node server.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=18"
   }
 }
